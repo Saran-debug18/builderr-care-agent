@@ -1,347 +1,631 @@
-"""Calmar Rotation Hybrid.
+"""
+CARE — Calmar-Adaptive Regime Engine
+=====================================
+builderr Trading Challenge submission.
 
-Contest objective: maximize 60-day forward Calmar, not raw return.
+Optimization target: Calmar ratio (annualized_return / max_drawdown) over 30 days.
 
-The agent uses only the provided daily bars. It has no network calls, no LLM,
-no API keys, and no dependencies outside the Python standard library.
+Design philosophy
+-----------------
+The Calmar denominator (max drawdown) is permanently and irreversibly damaged by a
+single bad day.  Protecting it beats chasing the numerator.  Every design decision
+here flows from that one fact:
 
-Core idea:
-  * Risk-off when SPY/QQQ lose their 50-day trends or QQQ volatility is high.
-  * Risk-on rotates into the strongest broad/sector/mega-cap sleeves.
-  * A small 2x ETF overlay is allowed only in calm QQQ uptrends.
-  * Every target is capped below 24% and beta-adjusted gross is scaled below 1.35x.
+  1. Multi-signal composite regime score — continuous 0-1 score across trend,
+     momentum, and volatility prevents the abrupt binary ON/OFF flip-flopping that
+     churns trades and misses recovery entries.
+
+  2. Four exposure levels (full / moderate / defensive / cash) with hysteresis —
+     "full" stays full through small wobbles; it takes a genuine breakdown to de-risk.
+     De-risking happens immediately; re-risking waits for the cadence.
+
+  3. Fast crash brake — a hard override that fires on a 3- or 5-day QQQ price plunge
+     or an extreme 10-day vol spike.  Moves us to cash within one bar of the event.
+
+  4. Inverse-volatility position sizing — names with lower realized vol receive
+     higher allocation.  This directly minimizes each name's expected contribution
+     to portfolio drawdown.
+
+  5. Portfolio-level drawdown stop — if OUR equity curve falls 4/8/14% from its
+     peak, we automatically cap the regime at moderate/defensive/cash regardless of
+     market signals.  The last-resort line that saves us when signals are slow.
+
+  6. No leveraged ETFs — over a 30-day Calmar window, 2x/3x products add more to
+     the drawdown denominator (gap risk, vol decay, leverage reset) than to the
+     return numerator.  1x long-only, capped at ~0.95x beta-adjusted gross.
+
+All computation uses only the Python standard library — no network calls, no LLM,
+no API keys.  All signals are constructed from the historical bars provided in
+market_state, so there is zero lookahead bias.
 """
 from __future__ import annotations
 
-from math import sqrt
-from statistics import mean, pstdev
-from typing import Any
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIVERSE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Public v0 universe. Keep leveraged names out of the ranker; only use them as
-# a tightly gated overlay.
-RISK_CANDIDATES = (
-    "SPY", "QQQ", "DIA", "IWM",
-    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "SMH",
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
+# Risk-on candidates: broad indices, sectors, mega-cap tech
+_RISK_ON = (
+    "SPY", "QQQ", "SMH",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLC", "XLRE",
+    "NVDA", "MSFT", "AAPL", "META", "GOOGL", "AMZN", "AVGO",
+    "IWM",
 )
-DEFENSIVE_WEIGHTS = (
-    ("XLP", 0.24),
-    ("XLU", 0.24),
-    ("XLV", 0.20),
-    ("XLE", 0.12),
-)
-BETA_MULTIPLE = {
-    "TQQQ": 3.0, "SOXL": 3.0, "UPRO": 3.0, "SPXL": 3.0, "TNA": 3.0,
-    "FAS": 3.0, "TECL": 3.0, "LABU": 3.0, "CURE": 3.0, "DRN": 3.0,
-    "UDOW": 3.0, "NAIL": 3.0,
-    "QLD": 2.0, "SSO": 2.0, "DDM": 2.0, "ROM": 2.0, "UWM": 2.0, "AGQ": 2.0,
+
+# Defensive candidates: low-beta, low-correlation assets
+_DEFENSIVE = ("XLP", "XLU", "XLV", "GLD")
+
+# Combined pool used for "moderate" regime ranking
+_ALL = _RISK_ON + ("XLP", "XLU", "GLD")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REGIME PARAMETERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SMA_SHORT = 50          # short trend filter (days)
+_SMA_LONG  = 100         # long trend filter (days)
+_TREND_BAND = 0.01       # hysteresis: need +1% above SMA to count as "above"
+
+_MOM_FAST = 20           # fast momentum window (days)
+_MOM_MED  = 60           # medium momentum window — primary cross-sectional signal
+_MOM_SKIP = 5            # skip last N days to avoid short-term reversal effect
+
+_VOL_WIN = 20            # realized-vol lookback (days)
+
+# Crash brake — hard override, fires on extreme, fast moves only
+_BRAKE_3D     = -0.050   # 3-day QQQ return threshold
+_BRAKE_5D     = -0.070   # 5-day QQQ return threshold
+_BRAKE_VOL10  = 0.65     # 10-day annualized QQQ vol (extreme meltdown only)
+
+# Composite score → regime mapping thresholds
+# Higher score = more risk-on conditions
+_THRESH_FULL_UP   = 0.65  # score above this → full  (from lower regime)
+_THRESH_FULL_STAY = 0.38  # score above this → stay full (from full)
+_THRESH_MOD_UP    = 0.48  # score above this → moderate (from defensive)
+_THRESH_MOD_STAY  = 0.28  # score above this → stay moderate (from moderate)
+_THRESH_DEF       = 0.22  # score above this → defensive (otherwise cash)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POSITION SIZING PARAMETERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_NAME_CAP   = 0.20       # max weight per name (well under the 30% rule)
+_GROSS_MAX  = 0.97       # hard ceiling on total exposure
+_TARGET_VOL = 0.13       # annualized portfolio vol target for gross scaling
+_VOL_SCALE_FLOOR = 0.50  # vol-scaling never cuts below this fraction of regime gross
+
+_TOP_N_FULL = 6          # names held in full regime
+_TOP_N_MOD  = 5          # names held in moderate regime (mix of risk + defensive)
+_TOP_N_DEF  = 3          # names held in defensive regime
+
+_DEAD_BAND = 0.025       # ignore rebalance orders smaller than 2.5% of equity
+
+# Target gross by regime (before vol scaling)
+_REGIME_GROSS = {
+    "full":      0.95,
+    "moderate":  0.65,
+    "defensive": 0.25,
+    "cash":      0.05,
 }
 
-REBALANCE_EVERY_DAYS = 5
-MAX_WEIGHT = 0.24
-DRIFT_LIMIT = 0.27
-MAX_BETA_GROSS = 1.35
-MIN_TRADE_PCT = 0.015
+_REGIME_ORDER = ["full", "moderate", "defensive", "cash"]  # most→least risk
 
-_last_rebalance_bar_date: str | None = None
-_last_targets: dict[str, float] = {}
+# ═══════════════════════════════════════════════════════════════════════════════
+# REBALANCING / CADENCE PARAMETERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_REBALANCE_DAYS = 5      # routine rebalance cadence (trading days)
+_DRIFT_LIMIT    = 0.25   # trigger early rebalance if any position drifts past this
+_COOLDOWN_DAYS  = 1      # days to stay cautious after crash brake fires
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PORTFOLIO-LEVEL DRAWDOWN STOPS
+# Maximum drawdown from rolling peak equity that forces a regime downgrade
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_DD_TO_MODERATE  = 0.04  # 4%  drawdown → cap regime at "moderate"
+_DD_TO_DEFENSIVE = 0.08  # 8%  drawdown → cap regime at "defensive"
+_DD_TO_CASH      = 0.14  # 14% drawdown → cap regime at "cash"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODULE STATE  (resets per subprocess — mirrors engine behavior)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_tick           = 0
+_last_rebalance = -(10 ** 9)
+_last_regime    = None     # type: str | None
+_cooldown_left  = 0
+_peak_equity    = None     # type: float | None
+
+_ANN = 252 ** 0.5          # annualization constant for daily returns
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIGNAL PRIMITIVES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _closes(bars: list) -> list:
+    """Extract close prices from bar list, oldest first."""
+    return [float(b["close"]) for b in bars] if bars else []
 
 
-def closes(bars: list[dict[str, Any]] | None) -> list[float]:
-    if not bars:
-        return []
-    out: list[float] = []
-    for bar in bars:
-        try:
-            close = float(bar["close"])
-        except (KeyError, TypeError, ValueError):
-            return []
-        if close <= 0:
-            return []
-        out.append(close)
-    return out
+def _sma(c: list, n: int):
+    """Simple moving average of last n values. Returns None if insufficient data."""
+    return sum(c[-n:]) / n if len(c) >= n else None
 
 
-def sma(values: list[float], n: int) -> float | None:
-    if len(values) < n:
+def _ann_vol(c: list, n: int):
+    """
+    Annualized realized volatility from the last n daily returns.
+    Returns None if insufficient data; uses population std with small-sample guard.
+    """
+    if len(c) < n + 1:
         return None
-    return mean(values[-n:])
-
-
-def momentum(values: list[float], n: int) -> float | None:
-    if len(values) <= n:
-        return None
-    start = values[-(n + 1)]
-    if start <= 0:
-        return None
-    return values[-1] / start - 1.0
-
-
-def realized_vol(values: list[float], n: int) -> float | None:
-    if len(values) <= n:
-        return None
-    window = values[-(n + 1):]
-    rets = []
-    for i in range(1, len(window)):
-        prev = window[i - 1]
-        if prev <= 0:
-            return None
-        rets.append(window[i] / prev - 1.0)
+    rets = [c[i] / c[i - 1] - 1.0
+            for i in range(len(c) - n, len(c))
+            if c[i - 1] > 0]
     if len(rets) < 5:
         return None
-    return pstdev(rets) * sqrt(252.0)
+    mean = sum(rets) / len(rets)
+    # Use sample variance (n-1) for unbiased estimate
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return var ** 0.5 * _ANN
 
 
-def current_positions(portfolio_state: dict[str, Any]) -> dict[str, dict[str, float]]:
-    positions: dict[str, dict[str, float]] = {}
-    for raw in portfolio_state.get("positions", []) or []:
-        ticker = str(raw.get("ticker", "")).upper()
-        if not ticker:
-            continue
-        try:
-            qty = float(raw.get("quantity", 0.0))
-            avg_cost = float(raw.get("avg_cost", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if qty <= 0:
-            continue
-        existing = positions.setdefault(ticker, {"quantity": 0.0, "avg_cost": avg_cost})
-        existing["quantity"] += qty
-        existing["avg_cost"] = avg_cost or existing["avg_cost"]
-    return positions
-
-
-def equity(portfolio_state: dict[str, Any], cash: float) -> float:
-    try:
-        total = float(portfolio_state.get("cash", cash))
-    except (TypeError, ValueError):
-        total = float(cash or 0.0)
-    last_prices = portfolio_state.get("last_prices", {}) or {}
-    for ticker, pos in current_positions(portfolio_state).items():
-        try:
-            price = float(last_prices.get(ticker, pos["avg_cost"]))
-        except (TypeError, ValueError):
-            price = pos["avg_cost"]
-        total += pos["quantity"] * max(price, 0.0)
-    return max(total, 0.0)
-
-
-def _latest_bar_date(market_state: dict[str, list[dict[str, Any]]]) -> str | None:
-    bars = market_state.get("SPY") or market_state.get("QQQ") or []
-    if not bars:
+def _ret(c: list, days: int, skip: int = 0):
+    """
+    Return over a window of `days`, optionally skipping the last `skip` bars.
+    The skip handles the short-term reversal effect in momentum literature.
+    """
+    need = days + skip + 1
+    if len(c) < need:
         return None
-    ts = bars[-1].get("ts")
-    if ts is None:
-        return str(len(bars))
-    # ISO dates sort lexicographically; keeping the first 10 chars handles both
-    # YYYY-MM-DD and full timestamps.
-    return str(ts)[:10]
+    end   = c[-(skip + 1)] if skip > 0 else c[-1]
+    start = c[-(days + skip + 1)]
+    return end / start - 1.0 if start > 0 else None
 
 
-def _days_since_rebalance(market_state: dict[str, list[dict[str, Any]]]) -> int | None:
-    if _last_rebalance_bar_date is None:
+def _momentum_score(c: list, require_uptrend: bool = True):
+    """
+    Multi-timeframe momentum composite for cross-sectional ranking.
+
+    Formula: (0.40 * r_med + 0.30 * r_fast + 0.15 * trend_gap) * vol_adj
+
+    - r_med: 60-day return skipping last 5 days (removes reversal drag)
+    - r_fast: 20-day return (recency weight)
+    - trend_gap: distance above 50-day SMA (trend confirmation)
+    - vol_adj: penalizes high-vol names since they are bigger DD contributors
+
+    Returns None if data is insufficient or (when require_uptrend=True) if
+    the name is below its 50-day SMA — we never buy downtrending assets.
+    """
+    sma   = _sma(c, _SMA_SHORT)
+    r_f   = _ret(c, _MOM_FAST)
+    r_m   = _ret(c, _MOM_MED, _MOM_SKIP)
+    v     = _ann_vol(c, _VOL_WIN)
+    if sma is None or r_f is None or r_m is None or not c:
         return None
-    bars = market_state.get("SPY") or market_state.get("QQQ") or []
-    dates = [str(b.get("ts", i))[:10] for i, b in enumerate(bars)]
-    if not dates or _last_rebalance_bar_date not in dates:
-        return None
-    return len(dates) - dates.index(_last_rebalance_bar_date) - 1
+    if require_uptrend and c[-1] < sma:
+        return None  # below own 50-day SMA → not in uptrend, skip
+    trend_gap = c[-1] / sma - 1.0
+    v_safe    = max(v, 0.05) if v is not None else 0.20
+    vol_adj   = max(0.10, 1.0 - v_safe / 0.50)  # 0.10–1.0; high vol → lower score
+    return (0.40 * r_m + 0.30 * r_f + 0.15 * trend_gap) * vol_adj
 
 
-def _market_prices(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
-    prices: dict[str, float] = {}
-    for ticker, bars in market_state.items():
-        cs = closes(bars)
-        if cs:
-            prices[ticker.upper()] = cs[-1]
-    return prices
+# ═══════════════════════════════════════════════════════════════════════════════
+# REGIME DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-
-def _risk_off_targets(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
-    return {ticker: weight for ticker, weight in DEFENSIVE_WEIGHTS if closes(market_state.get(ticker))}
-
-
-def _scale_caps(weights: dict[str, float]) -> dict[str, float]:
-    capped = {t: min(max(w, 0.0), MAX_WEIGHT) for t, w in weights.items() if w > 0.0}
-    beta_gross = sum(w * BETA_MULTIPLE.get(t, 1.0) for t, w in capped.items())
-    if beta_gross > MAX_BETA_GROSS:
-        scale = MAX_BETA_GROSS / beta_gross
-        capped = {t: w * scale for t, w in capped.items()}
-    return {t: round(w, 6) for t, w in capped.items() if w > 0.001}
-
-
-def target_weights(market_state: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
-    spy = closes(market_state.get("SPY"))
-    qqq = closes(market_state.get("QQQ"))
-    if len(spy) < 50 or len(qqq) < 50:
-        return {}
-
-    spy_sma50 = sma(spy, 50)
-    qqq_sma50 = sma(qqq, 50)
-    qqq_vol20 = realized_vol(qqq, 20)
-    risk_on = bool(
-        spy_sma50 is not None
-        and qqq_sma50 is not None
-        and qqq_vol20 is not None
-        and spy[-1] > spy_sma50
-        and qqq[-1] > qqq_sma50
-        and qqq_vol20 < 0.35
-    )
-    if not risk_on:
-        return _scale_caps(_risk_off_targets(market_state))
-
-    scored: list[tuple[float, str]] = []
-    for ticker in RISK_CANDIDATES:
-        values = closes(market_state.get(ticker))
-        if len(values) < 61:
-            continue
-        mom60 = momentum(values, 60)
-        mom20 = momentum(values, 20)
-        trend50 = sma(values, 50)
-        vol20 = realized_vol(values, 20)
-        if mom60 is None or mom20 is None or trend50 is None or vol20 is None:
-            continue
-        trend_gap = values[-1] / trend50 - 1.0
-        score = (0.55 * mom60) + (0.25 * mom20) + (0.20 * trend_gap) - (0.15 * vol20)
-        if score > 0.0:
-            scored.append((score, ticker))
-
-    scored.sort(reverse=True)
-    winners = [ticker for _, ticker in scored[:5]]
-    if not winners:
-        return _scale_caps(_risk_off_targets(market_state))
-
-    qqq_sma20 = sma(qqq, 20)
-    qqq_mom20 = momentum(qqq, 20)
-    overlay_on = bool(
-        qqq_sma20 is not None
-        and qqq_sma50 is not None
-        and qqq_mom20 is not None
-        and qqq_sma20 > qqq_sma50
-        and qqq_mom20 > 0.0
-        and qqq_vol20 < 0.28
-        and closes(market_state.get("QLD"))
-        and closes(market_state.get("SSO"))
-    )
-
-    weights: dict[str, float] = {}
-    base_budget = 0.76 if overlay_on else 0.92
-    per_winner = min(MAX_WEIGHT - 0.02, base_budget / len(winners))
-    for ticker in winners:
-        weights[ticker] = per_winner
-
-    if overlay_on:
-        weights["QLD"] = 0.11
-        weights["SSO"] = 0.07
-
-    return _scale_caps(weights)
-
-
-def orders_to_rebalance(
-    targets: dict[str, float],
-    positions: dict[str, dict[str, float]],
-    total_equity: float,
-    prices: dict[str, float],
-    cash_available: float,
-) -> list[dict[str, object]]:
-    if total_equity <= 0:
-        return []
-
-    min_trade = total_equity * MIN_TRADE_PCT
-    orders: list[dict[str, object]] = []
-    sell_proceeds = 0.0
-
-    # Sells first: remove stale holdings and trim overweight target holdings.
-    for ticker, pos in positions.items():
-        price = prices.get(ticker)
-        if price is None or price <= 0:
-            continue
-        qty = pos["quantity"]
-        current_value = qty * price
-        target_value = total_equity * targets.get(ticker, 0.0)
-        delta = target_value - current_value
-        if ticker not in targets:
-            sell_qty = int(qty)
-            if sell_qty > 0 and current_value >= min_trade:
-                orders.append({"ticker": ticker, "side": "sell", "quantity": sell_qty})
-                sell_proceeds += sell_qty * price
-        elif delta < -min_trade:
-            sell_qty = min(int(abs(delta) // price), int(qty))
-            if sell_qty > 0:
-                orders.append({"ticker": ticker, "side": "sell", "quantity": sell_qty})
-                sell_proceeds += sell_qty * price
-
-    spendable = max(float(cash_available), 0.0) + (sell_proceeds * 0.98)
-
-    # Buys second: use expected cash after sells and skip tiny adjustments.
-    for ticker, weight in sorted(targets.items()):
-        price = prices.get(ticker)
-        if price is None or price <= 0:
-            continue
-        current_qty = positions.get(ticker, {}).get("quantity", 0.0)
-        current_value = current_qty * price
-        target_value = total_equity * weight
-        delta = target_value - current_value
-        if delta < min_trade:
-            continue
-        buy_value = min(delta, spendable)
-        buy_qty = int(buy_value // price)
-        if buy_qty > 0:
-            orders.append({"ticker": ticker, "side": "buy", "quantity": buy_qty})
-            spendable -= buy_qty * price
-
-    return orders[:45]
-
-
-def _has_position_drifted(portfolio_state: dict[str, Any], total_equity: float) -> bool:
-    if total_equity <= 0:
-        return False
-    last_prices = portfolio_state.get("last_prices", {}) or {}
-    for ticker, pos in current_positions(portfolio_state).items():
-        try:
-            price = float(last_prices.get(ticker, pos["avg_cost"]))
-        except (TypeError, ValueError):
-            price = pos["avg_cost"]
-        if price > 0 and (pos["quantity"] * price / total_equity) > DRIFT_LIMIT:
-            return True
+def _crash_brake(market_state: dict) -> bool:
+    """
+    Hard override: returns True on a fast crash or extreme vol spike.
+    Deliberately keeps the vol trigger very high — moderate elevated vol is
+    handled by vol-targeting the gross, not by going to cash and missing the
+    snapback whose realized vol stays high while prices recover.
+    """
+    qqq = _closes(market_state.get("QQQ") or [])
+    r3  = _ret(qqq, 3)
+    r5  = _ret(qqq, 5)
+    v10 = _ann_vol(qqq, 10)
+    if r3 is not None and r3 < _BRAKE_3D:
+        return True
+    if r5 is not None and r5 < _BRAKE_5D:
+        return True
+    if v10 is not None and v10 > _BRAKE_VOL10:
+        return True
     return False
 
 
-def decide(
+def _composite_score(market_state: dict) -> float:
+    """
+    Composite regime score in [0, 1].  Higher = more risk-on conditions.
+    Three components, each normalized to [0, 1]:
+
+      Trend component    (35% weight)
+        SPY & QQQ position vs. their 50-day and 100-day SMAs.
+
+      Momentum component (30% weight)
+        SPY & QQQ 20-day and 60-day returns (signed: positive = +1, negative = 0).
+
+      Volatility component (35% weight)
+        QQQ 20-day annualized vol mapped to a 0-1 scale (lower vol → higher score).
+    """
+    qqq = _closes(market_state.get("QQQ") or [])
+    spy = _closes(market_state.get("SPY") or [])
+    if len(qqq) < 10 or len(spy) < 10:
+        return 0.0
+
+    score  = 0.0
+    weight = 0.0
+
+    # ── Trend (35%) ───────────────────────────────────────────────────────
+    trend_pts = 0.0
+    for closes, label in ((spy, "SPY"), (qqq, "QQQ")):
+        sma50  = _sma(closes, _SMA_SHORT)
+        sma100 = _sma(closes, _SMA_LONG)
+        last   = closes[-1]
+        if sma50 is not None:
+            if last > sma50 * (1 + _TREND_BAND):
+                trend_pts += 0.25          # clearly above 50d SMA
+            elif last > sma50:
+                trend_pts += 0.15          # just above (partial credit)
+        if sma100 is not None and last > sma100:
+            trend_pts += 0.25              # above 100d SMA (secondary confirmation)
+    score  += 0.35 * trend_pts
+    weight += 0.35
+
+    # ── Momentum (30%) ────────────────────────────────────────────────────
+    # Note: no skip here — we want the most current reading for regime
+    # detection.  The skip is only applied in cross-sectional name ranking
+    # where the short-term reversal effect is relevant.
+    mom_pts = 0.0
+    for closes in (spy, qqq):
+        r20 = _ret(closes, _MOM_FAST)
+        r60 = _ret(closes, _MOM_MED)   # no skip — use current 60d window
+        if r20 is not None:
+            mom_pts += 0.25 if r20 > 0 else 0.0
+        if r60 is not None:
+            mom_pts += 0.25 if r60 > 0 else 0.0
+    score  += 0.30 * mom_pts
+    weight += 0.30
+
+    # ── Volatility (35%) ──────────────────────────────────────────────────
+    # Linear: 1.0 at 10% vol, 0.0 at 42% vol — no step-boundary oscillation.
+    v20 = _ann_vol(qqq, _VOL_WIN)
+    if v20 is not None:
+        vol_pts = max(0.0, min(1.0, 1.0 - (v20 - 0.10) / 0.32))
+        score  += 0.35 * vol_pts
+        weight += 0.35
+
+    return score / weight if weight > 0 else 0.0
+
+
+def _detect_regime(market_state: dict) -> str:
+    """
+    Returns one of: 'full', 'moderate', 'defensive', 'cash'.
+
+    Hysteresis logic: once in a higher-risk regime, we require a clear
+    breakdown to drop — avoiding the daily SMA-cross flip-flop in choppy
+    markets.  The crash brake always overrides this and goes directly to cash.
+
+    Cooldown: after crash brake fires, we stay cautious for _COOLDOWN_DAYS
+    even if signals immediately recover — prevents jumping into a dead-cat-
+    bounce snapback.
+    """
+    global _cooldown_left
+
+    if _crash_brake(market_state):
+        _cooldown_left = _COOLDOWN_DAYS
+        return "cash"
+
+    score = _composite_score(market_state)
+
+    if _cooldown_left > 0:
+        _cooldown_left -= 1
+        return "defensive" if score > 0.45 else "cash"
+
+    prev = _last_regime
+
+    if prev == "full":
+        if score >= _THRESH_FULL_STAY:
+            return "full"
+        elif score >= _THRESH_MOD_STAY:
+            return "moderate"
+        else:
+            return "defensive"
+
+    elif prev == "moderate":
+        if score >= _THRESH_FULL_UP:
+            return "full"
+        elif score >= _THRESH_MOD_STAY:
+            return "moderate"
+        else:
+            return "defensive"
+
+    elif prev == "defensive":
+        if score >= _THRESH_FULL_UP:
+            return "full"
+        elif score >= _THRESH_MOD_UP:
+            return "moderate"
+        elif score >= _THRESH_DEF:
+            return "defensive"
+        else:
+            return "cash"
+
+    else:
+        # Cold start: be conservative — require a clear bull signal to go full
+        if score >= _THRESH_FULL_UP:
+            return "full"
+        elif score >= _THRESH_MOD_UP:
+            return "moderate"
+        elif score >= _THRESH_DEF:
+            return "defensive"
+        else:
+            return "cash"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PORTFOLIO-LEVEL DRAWDOWN STOP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _apply_dd_override(regime: str, equity: float, peak: float) -> str:
+    """
+    Cap the regime based on how far our own portfolio has drawn down from peak.
+    This is the last-resort safety net: if our signals are wrong and we ARE
+    losing money, we automatically reduce exposure to protect the Calmar
+    denominator regardless of what market indicators say.
+    """
+    if peak <= 0:
+        return regime
+    dd = (peak - equity) / peak
+    if dd >= _DD_TO_CASH:
+        return "cash"
+    if dd >= _DD_TO_DEFENSIVE:
+        # Clamp: regime cannot be better than "defensive"
+        idx = max(_REGIME_ORDER.index(regime), _REGIME_ORDER.index("defensive"))
+        return _REGIME_ORDER[idx]
+    if dd >= _DD_TO_MODERATE:
+        idx = max(_REGIME_ORDER.index(regime), _REGIME_ORDER.index("moderate"))
+        return _REGIME_ORDER[idx]
+    return regime
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# POSITION SELECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _rank_by_momentum(
     market_state: dict,
-    portfolio_state: dict,
-    cash: float,
-) -> list[dict]:
-    """Return a list of long-only buy/sell orders."""
-    global _last_rebalance_bar_date, _last_targets
+    universe: tuple,
+    require_uptrend: bool = True,
+) -> list:
+    """Rank names in universe by momentum score, best first. Filters out None scores."""
+    scored = []
+    for t in universe:
+        bars = market_state.get(t)
+        if not bars:
+            continue
+        s = _momentum_score(_closes(bars), require_uptrend=require_uptrend)
+        if s is not None:
+            scored.append((s, t))
+    scored.sort(reverse=True)
+    return [t for _, t in scored]
 
-    if not market_state:
+
+def _inv_vol_weights(
+    names: list,
+    market_state: dict,
+    gross: float,
+) -> dict:
+    """
+    Inverse-volatility weighting: names with lower realized vol receive
+    proportionally higher allocation, capped at _NAME_CAP per name.
+
+    The gross target controls total exposure.  If some names hit the cap,
+    the remaining gross is lost to cash — that is intentional and conservative.
+    """
+    if not names:
+        return {}
+    inv = {}
+    for t in names:
+        c = _closes(market_state.get(t) or [])
+        v = _ann_vol(c, _VOL_WIN)
+        if v and v > 1e-6:
+            inv[t] = 1.0 / v
+        else:
+            inv[t] = 1.0 / 0.20  # fallback: assume 20% annual vol
+    total = sum(inv.values())
+    return {t: min(_NAME_CAP, gross * x / total) for t, x in inv.items()}
+
+
+def _vol_scaled_gross(regime: str, market_state: dict) -> float:
+    """
+    Scale the regime's base gross down when market vol is elevated, targeting
+    _TARGET_VOL portfolio annualized volatility.  Never goes below 50% of the
+    base gross — vol-targeting shouldn't lock us out of a recovering market.
+    """
+    base = _REGIME_GROSS[regime]
+    if regime in ("cash", "defensive", "moderate"):
+        return base  # already de-risked; don't compound with vol scaling
+    qqq = _closes(market_state.get("QQQ") or [])
+    mkt_vol = _ann_vol(qqq, _VOL_WIN) or 0.20
+    scaled = min(base, _TARGET_VOL / mkt_vol)
+    floor  = base * _VOL_SCALE_FLOOR
+    return max(floor, min(_GROSS_MAX, scaled))
+
+
+def _target_weights(market_state: dict, regime: str) -> dict:
+    """
+    Compute target allocation weights for each position given the current regime.
+
+      full      → top _TOP_N_FULL risk-on names, inv-vol weighted
+      moderate  → top risk names + defensive ballast, mixed inv-vol weighted
+      defensive → top _TOP_N_DEF defensive names, inv-vol weighted
+      cash      → tiny XLP/XLU sleeve to avoid sitting completely flat
+                  (helps if the market rips back — even 5% participation helps Calmar)
+    """
+    gross = _vol_scaled_gross(regime, market_state)
+
+    if regime == "full":
+        ranked = _rank_by_momentum(market_state, _RISK_ON)
+        selected = ranked[:_TOP_N_FULL]
+        if not selected:
+            # Fallback: if nothing passes the SMA filter, go defensive
+            ranked_def = _rank_by_momentum(market_state, _DEFENSIVE, require_uptrend=False)
+            return _inv_vol_weights(ranked_def[:_TOP_N_DEF], market_state,
+                                    _REGIME_GROSS["defensive"])
+        return _inv_vol_weights(selected, market_state, gross)
+
+    if regime == "moderate":
+        # ~70% risk, ~30% defensive — blended by inverse vol
+        ranked_risk = _rank_by_momentum(market_state, _RISK_ON)
+        ranked_def  = _rank_by_momentum(market_state, ("XLP", "XLU", "GLD"),
+                                        require_uptrend=False)
+        risk_sel = ranked_risk[:3]
+        def_sel  = [t for t in ranked_def[:2] if t not in risk_sel]
+        combined = risk_sel + def_sel
+        if not combined:
+            return _inv_vol_weights(
+                _rank_by_momentum(market_state, _DEFENSIVE, require_uptrend=False)[:_TOP_N_DEF],
+                market_state, _REGIME_GROSS["defensive"],
+            )
+        return _inv_vol_weights(combined, market_state, gross)
+
+    if regime == "defensive":
+        ranked = _rank_by_momentum(market_state, _DEFENSIVE, require_uptrend=False)
+        selected = ranked[:_TOP_N_DEF]
+        if not selected:
+            return {}
+        return _inv_vol_weights(selected, market_state, gross)
+
+    # regime == "cash"
+    fallback = [t for t in ("XLP", "XLU") if market_state.get(t)]
+    return _inv_vol_weights(fallback, market_state, gross) if fallback else {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ORDER GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _generate_orders(
+    targets: dict,
+    positions: dict,
+    last_prices: dict,
+    equity: float,
+) -> list:
+    """
+    Produce buy/sell orders to move from current holdings toward target weights.
+    Skips trivial trades smaller than _DEAD_BAND * equity to control turnover.
+    Sells come before buys to free cash first.
+    """
+    orders = []
+
+    # ── Sells first ───────────────────────────────────────────────────────
+    for ticker, pos in positions.items():
+        qty = pos.get("quantity", 0)
+        if qty <= 0:
+            continue
+        px = last_prices.get(ticker, pos.get("avg_cost", 0))
+        if px <= 0:
+            continue
+
+        target_wt = targets.get(ticker, 0.0)
+        target_val = equity * target_wt
+        current_val = qty * px
+
+        if ticker not in targets:
+            # Full exit
+            orders.append({"ticker": ticker, "side": "sell", "quantity": qty})
+            continue
+
+        delta = target_val - current_val
+        if abs(delta) < _DEAD_BAND * equity:
+            continue
+        if delta < 0:
+            sell_qty = min(qty, int(abs(delta) / px))
+            if sell_qty > 0:
+                orders.append({"ticker": ticker, "side": "sell", "quantity": sell_qty})
+
+    # ── Buys ──────────────────────────────────────────────────────────────
+    for ticker, weight in targets.items():
+        if weight <= 0:
+            continue
+        px = last_prices.get(ticker, 0)
+        if px <= 0:
+            continue
+        cur_qty = positions.get(ticker, {}).get("quantity", 0)
+        target_val  = equity * weight
+        current_val = cur_qty * px
+        delta       = target_val - current_val
+        if abs(delta) < _DEAD_BAND * equity:
+            continue
+        if delta > 0:
+            buy_qty = int(delta / px)
+            if buy_qty > 0:
+                orders.append({"ticker": ticker, "side": "buy", "quantity": buy_qty})
+
+    return orders
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def decide(market_state, portfolio_state, cash):
+    """
+    Called once per trading day by the builderr engine.
+
+    Returns a list of orders: [{"ticker": str, "side": "buy"|"sell", "quantity": float}]
+    Orders fill at the NEXT day's open + slippage (5 bps regular, 10 bps leveraged).
+    An empty list means no action this tick.
+    """
+    global _tick, _last_rebalance, _last_regime, _peak_equity
+
+    _tick += 1
+
+    # ── 1. Compute equity, update rolling peak ────────────────────────────
+    positions    = {p["ticker"]: p for p in portfolio_state.get("positions", [])}
+    last_prices  = portfolio_state.get("last_prices", {})
+    equity       = portfolio_state.get("cash", cash)
+    for tk, pos in positions.items():
+        equity += pos["quantity"] * last_prices.get(tk, pos.get("avg_cost", 0))
+    if equity <= 0:
         return []
 
-    latest_date = _latest_bar_date(market_state)
-    if latest_date is None:
-        return []
+    if _peak_equity is None or equity > _peak_equity:
+        _peak_equity = equity
 
-    total_equity = equity(portfolio_state, cash)
-    days_since = _days_since_rebalance(market_state)
-    drifted = _has_position_drifted(portfolio_state, total_equity)
-    should_rebalance = (
-        _last_rebalance_bar_date is None
-        or days_since is None
-        or days_since >= REBALANCE_EVERY_DAYS
-        or drifted
+    # ── 2. Detect market regime ───────────────────────────────────────────
+    regime = _detect_regime(market_state)
+
+    # ── 3. Apply portfolio-level drawdown stop (last-resort override) ─────
+    regime = _apply_dd_override(regime, equity, _peak_equity)
+
+    # ── 4. Decide whether to rebalance this tick ──────────────────────────
+    # De-risking: always execute immediately (don't wait for cadence).
+    # Re-risking: only on the routine cadence or a drift breach.
+    regime_degraded = (
+        _last_regime is not None
+        and _REGIME_ORDER.index(regime) > _REGIME_ORDER.index(_last_regime)
     )
-    if not should_rebalance:
+    drifted = any(
+        pos["quantity"] * last_prices.get(t, pos.get("avg_cost", 0)) / equity > _DRIFT_LIMIT
+        for t, pos in positions.items()
+    ) if positions else False
+    on_cadence = (_tick - _last_rebalance) >= _REBALANCE_DAYS
+
+    _last_regime = regime  # update AFTER reading for hysteresis comparison
+
+    if not (regime_degraded or drifted or on_cadence):
         return []
 
-    targets = target_weights(market_state)
-    if not targets:
-        return []
+    # ── 5. Compute target allocation ──────────────────────────────────────
+    targets = _target_weights(market_state, regime)
 
-    prices = _market_prices(market_state)
-    positions = current_positions(portfolio_state)
-    orders = orders_to_rebalance(targets, positions, total_equity, prices, cash)
+    # ── 6. Generate and return orders ─────────────────────────────────────
+    orders = _generate_orders(targets, positions, last_prices, equity)
+
     if orders:
-        _last_rebalance_bar_date = latest_date
-        _last_targets = targets
+        _last_rebalance = _tick
+
     return orders
