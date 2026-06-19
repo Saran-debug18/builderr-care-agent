@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-06-18T20:31:00Z",
+  "generated_at_utc": "2026-06-19T16:34:38Z",
   "as_of_market_date": "2026-06-18",
   "round_start": "2026-06-02",
   "start_cash": 100000.0,
@@ -16,8 +16,8 @@
     {
       "name": "arnav",
       "label": "round 1 \u00b7 entrant",
-      "equity": 102333.68,
-      "pnl": 2333.68,
+      "equity": 102333.98,
+      "pnl": 2333.98,
       "ret": 0.0233,
       "trades": 42
     },
@@ -64,9 +64,9 @@
     {
       "name": "vol-target",
       "label": "reference",
-      "equity": 99988.68,
-      "pnl": -11.32,
-      "ret": -0.0001,
+      "equity": 100044.67,
+      "pnl": 44.67,
+      "ret": 0.0004,
       "trades": 9
     },
     {
@@ -104,8 +104,8 @@
     {
       "name": "zaid",
       "label": "round 1 \u00b7 entrant",
-      "equity": 98251.51,
-      "pnl": -1748.49,
+      "equity": 98251.57,
+      "pnl": -1748.43,
       "ret": -0.0175,
       "trades": 24
     },
@@ -128,9 +128,9 @@
     {
       "name": "harsimran",
       "label": "round 1 \u00b7 entrant",
-      "equity": 97652.06,
-      "pnl": -2347.94,
-      "ret": -0.0235,
+      "equity": 97720.75,
+      "pnl": -2279.25,
+      "ret": -0.0228,
       "trades": 37
     },
     {
@@ -152,9 +152,9 @@
     {
       "name": "robert",
       "label": "round 1 \u00b7 entrant",
-      "equity": 93432.36,
-      "pnl": -6567.64,
-      "ret": -0.0657,
+      "equity": 93456.8,
+      "pnl": -6543.2,
+      "ret": -0.0654,
       "trades": 29
     }
   ]
