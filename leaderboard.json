@@ -1,6 +1,6 @@
 {
-  "generated_at_utc": "2026-08-18T20:29:53Z",
-  "as_of_market_date": "2026-08-18",
+  "generated_at_utc": "2026-08-19T14:38:45Z",
+  "as_of_market_date": "2026-08-19",
   "round_start": "2026-06-02",
   "start_cash": 100000.0,
   "note": "Live Round 1 \u2014 every agent started with a $100,000 paper account on June 2, same data and fills for everyone, refreshed each market day. The final winner is risk-adjusted (see rules), so no one wins on a single lucky bet.",
@@ -8,50 +8,58 @@
     {
       "name": "dual-momentum-rotation",
       "label": "house \u00b7 all-weather",
-      "equity": 102187.72,
-      "pnl": 2187.72,
-      "ret": 0.0219,
+      "equity": 102412.26,
+      "pnl": 2412.26,
+      "ret": 0.0241,
       "trades": 5
     },
     {
       "name": "vol-target",
       "label": "reference",
-      "equity": 100922.8,
-      "pnl": 922.8,
-      "ret": 0.0092,
+      "equity": 101211.28,
+      "pnl": 1211.28,
+      "ret": 0.0121,
       "trades": 15
     },
     {
       "name": "opu",
       "label": "round 1 \u00b7 entrant",
-      "equity": 100531.7,
-      "pnl": 531.7,
+      "equity": 100529.7,
+      "pnl": 529.7,
       "ret": 0.0053,
       "trades": 22
     },
     {
       "name": "sector-rotation",
       "label": "reference",
-      "equity": 99432.65,
-      "pnl": -567.35,
-      "ret": -0.0057,
+      "equity": 99600.95,
+      "pnl": -399.05,
+      "ret": -0.004,
       "trades": 4
     },
     {
       "name": "sankeerth",
       "label": "round 1 \u00b7 entrant",
-      "equity": 98903.12,
-      "pnl": -1096.88,
-      "ret": -0.011,
+      "equity": 99370.3,
+      "pnl": -629.7,
+      "ret": -0.0063,
       "trades": 55
     },
     {
       "name": "ai-momentum-basket",
       "label": "house \u00b7 aggressive",
-      "equity": 96845.25,
-      "pnl": -3154.75,
-      "ret": -0.0315,
+      "equity": 97019.49,
+      "pnl": -2980.51,
+      "ret": -0.0298,
       "trades": 9
+    },
+    {
+      "name": "nagarjuna",
+      "label": "round 1 \u00b7 entrant",
+      "equity": 96086.2,
+      "pnl": -3913.8,
+      "ret": -0.0391,
+      "trades": 70
     },
     {
       "name": "eshwar",
@@ -62,100 +70,92 @@
       "trades": 16
     },
     {
-      "name": "nagarjuna",
-      "label": "round 1 \u00b7 entrant",
-      "equity": 95131.62,
-      "pnl": -4868.38,
-      "ret": -0.0487,
-      "trades": 70
-    },
-    {
       "name": "rohit",
       "label": "round 1 \u00b7 entrant",
-      "equity": 94871.7,
-      "pnl": -5128.3,
-      "ret": -0.0513,
+      "equity": 95390.06,
+      "pnl": -4609.94,
+      "ret": -0.0461,
       "trades": 53
     },
     {
       "name": "drawdown-momentum",
       "label": "house \u00b7 the bar to beat",
-      "equity": 94348.44,
-      "pnl": -5651.56,
-      "ret": -0.0565,
+      "equity": 94877.7,
+      "pnl": -5122.3,
+      "ret": -0.0512,
       "trades": 63
     },
     {
       "name": "arnav",
       "label": "round 1 \u00b7 entrant",
-      "equity": 94119.26,
-      "pnl": -5880.74,
-      "ret": -0.0588,
-      "trades": 100
+      "equity": 94297.03,
+      "pnl": -5702.97,
+      "ret": -0.057,
+      "trades": 102
     },
     {
       "name": "balaji",
       "label": "round 1 \u00b7 entrant",
-      "equity": 93202.79,
-      "pnl": -6797.21,
-      "ret": -0.068,
-      "trades": 41
-    },
-    {
-      "name": "zaid",
-      "label": "round 1 \u00b7 entrant",
-      "equity": 92814.24,
-      "pnl": -7185.76,
-      "ret": -0.0719,
-      "trades": 90
+      "equity": 94011.52,
+      "pnl": -5988.48,
+      "ret": -0.0599,
+      "trades": 43
     },
     {
       "name": "harsimran",
       "label": "round 1 \u00b7 entrant",
-      "equity": 92506.2,
-      "pnl": -7493.8,
-      "ret": -0.0749,
+      "equity": 93686.75,
+      "pnl": -6313.25,
+      "ret": -0.0631,
       "trades": 155
+    },
+    {
+      "name": "zaid",
+      "label": "round 1 \u00b7 entrant",
+      "equity": 92960.1,
+      "pnl": -7039.9,
+      "ret": -0.0704,
+      "trades": 91
     },
     {
       "name": "robert",
       "label": "round 1 \u00b7 entrant",
-      "equity": 92102.03,
-      "pnl": -7897.97,
-      "ret": -0.079,
-      "trades": 82
+      "equity": 92515.64,
+      "pnl": -7484.36,
+      "ret": -0.0748,
+      "trades": 88
     },
     {
       "name": "shyam",
       "label": "round 1 \u00b7 entrant",
-      "equity": 89240.61,
-      "pnl": -10759.39,
-      "ret": -0.1076,
+      "equity": 88716.1,
+      "pnl": -11283.9,
+      "ret": -0.1128,
       "trades": 40
     },
     {
       "name": "mohit",
       "label": "round 1 \u00b7 entrant",
-      "equity": 86279.99,
-      "pnl": -13720.01,
-      "ret": -0.1372,
+      "equity": 86447.72,
+      "pnl": -13552.28,
+      "ret": -0.1355,
       "trades": 56
     },
     {
       "name": "sumegh",
       "label": "round 1 \u00b7 entrant",
-      "equity": 82374.59,
-      "pnl": -17625.41,
-      "ret": -0.1763,
-      "trades": 27
+      "equity": 82235.35,
+      "pnl": -17764.65,
+      "ret": -0.1776,
+      "trades": 29
     },
     {
       "name": "siddu",
       "label": "round 1 \u00b7 entrant",
-      "equity": 77605.92,
-      "pnl": -22394.08,
-      "ret": -0.2239,
-      "trades": 143
+      "equity": 78477.79,
+      "pnl": -21522.21,
+      "ret": -0.2152,
+      "trades": 148
     }
   ]
 }
